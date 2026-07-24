@@ -1,14 +1,21 @@
-
 import os
 import json
 import sqlite3
 import random
 import string
+import telebot
 from flask import Flask, render_template_string, request, jsonify, redirect
 
-app = Flask(__name__)
+# --- НАСТРОЙКА БОТА И ПУТЕЙ ---
+BOT_TOKEN = os.getenv("BOT_TOKEN", "YOUR_TELEGRAM_BOT_TOKEN")
+bot = telebot.TeleBot(BOT_TOKEN, threaded=False)
+
+# На Vercel запись разрешена только в директорию /tmp
 DB_PATH = "/tmp/aether.db" if os.getenv("VERCEL") else "aether.db"
 
+app = Flask(__name__)
+
+# --- БАЗА ДАННЫХ ---
 def init_db():
     conn = sqlite3.connect(DB_PATH)
     cur = conn.cursor()
@@ -47,7 +54,7 @@ init_db()
 def generate_code(length=8):
     return ''.join(random.choices(string.ascii_uppercase + string.digits, k=length))
 
-# HTML + CSS + JS Template
+# --- HTML/CSS/JS ШАБЛОН MINI APP ---
 HTML_TEMPLATE = """
 <!DOCTYPE html>
 <html lang="ru">
@@ -87,7 +94,7 @@ HTML_TEMPLATE = """
         .screen {
             display: none;
             opacity: 0;
-            transition: opacity 0.5s ease;
+            transition: opacity 0.4s ease;
             padding: 24px 16px;
             min-height: 100vh;
             flex-direction: column;
@@ -100,7 +107,7 @@ HTML_TEMPLATE = """
             opacity: 1;
         }
 
-        /* Double Border Button */
+        /* Кнопка с двойным бордером */
         .btn-double {
             background: var(--button-bg);
             color: var(--button-text);
@@ -127,7 +134,7 @@ HTML_TEMPLATE = """
             cursor: pointer;
         }
 
-        /* Input Style */
+        /* Поле ввода M3 */
         .m3-input-wrapper {
             position: relative;
             width: 100%;
@@ -163,7 +170,7 @@ HTML_TEMPLATE = """
             text-transform: lowercase;
         }
 
-        /* Captcha Box */
+        /* Капча */
         .captcha-card {
             background: var(--surface-color);
             border: 1px solid var(--border-color);
@@ -184,7 +191,7 @@ HTML_TEMPLATE = """
             margin-top: 12px;
         }
 
-        /* Main Dashboard */
+        /* Главный экран */
         .header-title {
             font-size: 24px;
             font-weight: bold;
@@ -324,7 +331,7 @@ HTML_TEMPLATE = """
         if (tg) tg.expand();
 
         let userData = {
-            id: tg?.initDataUnsafe?.user?.id || 123456,
+            id: tg?.initDataUnsafe?.user?.id || 12345678,
             first_name: tg?.initDataUnsafe?.user?.first_name || 'User',
             username: tg?.initDataUnsafe?.user?.username || 'username',
             is_invited: 0,
@@ -358,7 +365,7 @@ HTML_TEMPLATE = """
 
         async function submitInvite() {
             const code = document.getElementById('invite-input').value.trim();
-            if(!code) return navTo('screen-main');
+            if(!code) return enterMainApp();
             
             const res = await fetch('/api/invite/use', {
                 method: 'POST',
@@ -370,7 +377,7 @@ HTML_TEMPLATE = """
                 userData.is_invited = 1;
                 userData.used_code = code;
             } else {
-                alert(data.message || "Ошибка кода");
+                alert(data.message || "Неверный код");
             }
             enterMainApp();
         }
@@ -461,11 +468,72 @@ HTML_TEMPLATE = """
 </html>
 """
 
-# --- ROUTES ---
+ADMIN_TEMPLATE = """
+<!DOCTYPE html>
+<html>
+<head>
+    <title>aether's Admin</title>
+    <style>
+        body { background: #000; color: #fff; font-family: sans-serif; padding: 20px; }
+        .card { background: #111; border: 1px solid #333; padding: 15px; border-radius: 12px; margin-bottom: 12px; }
+        button { background: #fff; color: #000; border: none; padding: 10px 20px; border-radius: 8px; font-weight: bold; cursor: pointer; }
+    </style>
+</head>
+<body>
+    <h2>aether's Admin Panel</h2>
+    <form action="/invc/generate" method="post" style="margin: 20px 0;">
+        <button type="submit">Сгенерировать инвайт</button>
+    </form>
+    
+    <h3>Инвайт коды</h3>
+    {% for code in invites %}
+        <div class="card">
+            Код: <b>{{ code[0] }}</b> | Использован: {{ "Да" if code[1] else "Нет" }}
+        </div>
+    {% endfor %}
+
+    <h3>Пользователи</h3>
+    {% for u in users %}
+        <div class="card">
+            ID: {{ u[0] }} | Name: {{ u[2] }} (@{{ u[1] }}) | Invited: {{ "YES" if u[3] else "NO" }}
+        </div>
+    {% endfor %}
+</body>
+</html>
+"""
+
+# --- МАРШРУТЫ FLASK ---
 
 @app.route('/')
 def index():
     return render_template_string(HTML_TEMPLATE)
+
+# Telegram Webhook Handler
+@app.route('/webhook', methods=['POST'])
+def webhook():
+    if request.headers.get('content-type') == 'application/json':
+        json_string = request.get_data().decode('utf-8')
+        update = telebot.types.Update.de_json(json_string)
+        bot.process_new_updates([update])
+        return 'ok', 200
+    return 'error', 400
+
+# Telegram Bot Handler
+@bot.message_handler(commands=['start'])
+def start_cmd(message):
+    keyboard = telebot.types.InlineKeyboardMarkup()
+    # Ссылка на Vercel Mini App
+    app_url = request.host_url
+    web_app_info = telebot.types.WebAppInfo(url=app_url)
+    keyboard.add(telebot.types.InlineKeyboardButton(text="Открыть aether's", web_app=web_app_info))
+    
+    bot.send_message(
+        message.chat.id, 
+        f"Привет, {message.from_user.first_name}! Нажми кнопку ниже, чтобы открыть Mini App:", 
+        reply_markup=keyboard
+    )
+
+# --- API КОРНЕВЫЕ МАРШРУТЫ ---
 
 @app.route('/api/user/sync', methods=['POST'])
 def sync_user():
@@ -516,41 +584,7 @@ def create_post():
     conn.close()
     return jsonify({"status": "ok"})
 
-# --- ADMIN PANEL (/invc) ---
-
-ADMIN_TEMPLATE = """
-<!DOCTYPE html>
-<html>
-<head>
-    <title>aether's Admin</title>
-    <style>
-        body { background: #000; color: #fff; font-family: sans-serif; padding: 20px; }
-        .card { background: #111; border: 1px solid #333; padding: 15px; border-radius: 12px; margin-bottom: 12px; }
-        button { background: #fff; color: #000; border: none; padding: 8px 16px; border-radius: 8px; font-weight: bold; cursor: pointer; }
-    </style>
-</head>
-<body>
-    <h2>aether's Admin Panel</h2>
-    <form action="/invc/generate" method="post" style="margin: 20px 0;">
-        <button type="submit">Сгенерировать инвайт</button>
-    </form>
-    
-    <h3>Инвайт коды</h3>
-    {% for code in invites %}
-        <div class="card">
-            Код: <b>{{ code[0] }}</b> | Использован: {{ "Да" if code[1] else "Нет" }}
-        </div>
-    {% endfor %}
-
-    <h3>Пользователи</h3>
-    {% for u in users %}
-        <div class="card">
-            ID: {{ u[0] }} | Name: {{ u[2] }} (@{{ u[1] }}) | Invited: {{ "YES" if u[3] else "NO" }}
-        </div>
-    {% endfor %}
-</body>
-</html>
-"""
+# --- АДМИНКА (/invc) ---
 
 @app.route('/invc')
 def admin_panel():
