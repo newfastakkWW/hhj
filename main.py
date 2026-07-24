@@ -1,11 +1,20 @@
+
 import os
 import sqlite3
 import random
 import string
+import threading
+import telebot
 from flask import Flask, render_template_string, request, jsonify
 
-# --- НАСТРОЙКИ VERCEL И БАЗЫ ДАННЫХ ---
-# Vercel разрешает запись только во временную папку /tmp
+# --- НАСТРОЙКИ ТОКЕНА И АДМИНОВ ---
+BOT_TOKEN = os.getenv("BOT_TOKEN", "YOUR_BOT_TOKEN_HERE")
+# Укажи свой Telegram ID (или список ID через запятую)
+ADMIN_IDS = [int(i.strip()) for i in os.getenv("ADMIN_IDS", "123456789").split(",") if i.strip().isdigit()]
+
+bot = telebot.TeleBot(BOT_TOKEN, threaded=False)
+
+# Выбор пути к БД (для Vercel используется /tmp/, локально — текущая папка)
 if os.getenv("VERCEL") or os.getenv("VERCEL_ENV"):
     DB_PATH = "/tmp/aether.db"
 else:
@@ -13,86 +22,245 @@ else:
 
 app = Flask(__name__)
 
-def get_db_connection():
-    conn = sqlite3.connect(DB_PATH)
+# --- БАЗА ДАННЫХ ---
+def get_db():
+    conn = sqlite3.connect(DB_PATH, check_same_thread=False)
     conn.row_factory = sqlite3.Row
     return conn
 
 def init_db():
-    try:
-        conn = get_db_connection()
-        cur = conn.cursor()
-        
-        cur.execute('''
-            CREATE TABLE IF NOT EXISTS users (
-                user_id INTEGER PRIMARY KEY,
-                username TEXT,
-                first_name TEXT,
-                avatar_url TEXT DEFAULT '',
-                is_invited INTEGER DEFAULT 0,
-                used_code TEXT DEFAULT '',
-                is_banned INTEGER DEFAULT 0,
-                ban_reason TEXT DEFAULT '',
-                ban_until TEXT DEFAULT '',
-                prefix TEXT DEFAULT 'USER',
-                prefix_color TEXT DEFAULT '#888888',
-                aliases TEXT DEFAULT '',
-                bg_color TEXT DEFAULT '#000000',
-                bg_emoji TEXT DEFAULT '',
-                bg_emoji_speed TEXT DEFAULT 'normal',
-                avatar_frame TEXT DEFAULT 'none',
-                nickname_color TEXT DEFAULT '#ffffff',
-                status_badge TEXT DEFAULT '',
-                status_type TEXT DEFAULT 'emoji'
-            )
-        ''')
-        
-        cur.execute('''
-            CREATE TABLE IF NOT EXISTS invites (
-                code TEXT PRIMARY KEY,
-                is_used INTEGER DEFAULT 0
-            )
-        ''')
-        
-        # Генерируем тестовый инвайт при первом запуске, если таблица пустая
-        cur.execute("SELECT COUNT(*) FROM invites")
-        if cur.fetchone()[0] == 0:
-            cur.execute("INSERT INTO invites (code, is_used) VALUES ('AETHER-TEST', 0)")
-            
-        cur.execute('''
-            CREATE TABLE IF NOT EXISTS posts (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                author_id INTEGER,
-                title TEXT,
-                content TEXT,
-                image_url TEXT DEFAULT '',
-                allow_comments INTEGER DEFAULT 1,
-                is_pinned INTEGER DEFAULT 0,
-                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-            )
-        ''')
-        
-        cur.execute('''
-            CREATE TABLE IF NOT EXISTS comments (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                post_id INTEGER,
-                author_id INTEGER,
-                content TEXT,
-                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-            )
-        ''')
-        
-        conn.commit()
-        conn.close()
-    except Exception as e:
-        print(f"Database Init Error: {e}")
+    conn = get_db()
+    cur = conn.cursor()
+    
+    cur.execute('''
+        CREATE TABLE IF NOT EXISTS users (
+            user_id INTEGER PRIMARY KEY,
+            username TEXT,
+            first_name TEXT,
+            avatar_url TEXT DEFAULT '',
+            is_invited INTEGER DEFAULT 0,
+            used_code TEXT DEFAULT '',
+            is_banned INTEGER DEFAULT 0,
+            ban_reason TEXT DEFAULT '',
+            ban_until TEXT DEFAULT '',
+            prefix TEXT DEFAULT 'USER',
+            prefix_color TEXT DEFAULT '#888888',
+            aliases TEXT DEFAULT '',
+            bg_color TEXT DEFAULT '#000000',
+            bg_emoji TEXT DEFAULT '',
+            bg_emoji_speed TEXT DEFAULT 'normal',
+            avatar_frame TEXT DEFAULT 'none',
+            nickname_color TEXT DEFAULT '#ffffff',
+            status_badge TEXT DEFAULT '',
+            status_type TEXT DEFAULT 'emoji'
+        )
+    ''')
+    
+    cur.execute('''
+        CREATE TABLE IF NOT EXISTS invites (
+            code TEXT PRIMARY KEY,
+            is_used INTEGER DEFAULT 0,
+            created_by INTEGER DEFAULT 0
+        )
+    ''')
+    
+    cur.execute('''
+        CREATE TABLE IF NOT EXISTS posts (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            author_id INTEGER,
+            title TEXT,
+            content TEXT,
+            image_url TEXT DEFAULT '',
+            allow_comments INTEGER DEFAULT 1,
+            is_pinned INTEGER DEFAULT 0,
+            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+        )
+    ''')
+    
+    cur.execute('''
+        CREATE TABLE IF NOT EXISTS comments (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            post_id INTEGER,
+            author_id INTEGER,
+            content TEXT,
+            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+        )
+    ''')
+    
+    conn.commit()
+    conn.close()
 
 init_db()
 
 def generate_code(length=8):
     return 'AETHER-' + ''.join(random.choices(string.ascii_uppercase + string.digits, k=length))
 
-# --- HTML / CSS / JS ---
+def is_admin(user_id):
+    return user_id in ADMIN_IDS
+
+# --- TELEGRAM BOT HANDLERS ---
+
+@bot.message_handler(commands=['start'])
+def cmd_start(message):
+    conn = get_db()
+    cur = conn.cursor()
+    cur.execute("INSERT OR IGNORE INTO users (user_id, username, first_name) VALUES (?, ?, ?)",
+                (message.from_user.id, message.from_user.username or '', message.from_user.first_name or ''))
+    conn.commit()
+    conn.close()
+    
+    msg = f"Привет, {message.from_user.first_name}! Добро пожаловать в **aether's**.\nОткрой Mini App через меню или кнопку ниже."
+    bot.reply_to(message, msg)
+
+@bot.message_handler(commands=['inv', 'invite'])
+def cmd_invites(message):
+    if not is_admin(message.from_user.id):
+        bot.reply_to(message, "❌ У вас нет прав администратора.")
+        return
+
+    args = message.text.split()
+    count = 1
+    if len(args) > 1 and args[1].isdigit():
+        count = min(int(args[1]), 20)
+
+    conn = get_db()
+    cur = conn.cursor()
+    generated = []
+    
+    for _ in range(count):
+        code = generate_code()
+        cur.execute("INSERT INTO invites (code, is_used, created_by) VALUES (?, 0, ?)", (code, message.from_user.id))
+        generated.append(f"`{code}`")
+        
+    conn.commit()
+    conn.close()
+
+    codes_str = "\n".join(generated)
+    bot.reply_to(message, f"✅ **Сгенерированы инвайты ({count} шт.):**\n\n{codes_str}", parse_mode="Markdown")
+
+@bot.message_handler(commands=['ban'])
+def cmd_ban(message):
+    if not is_admin(message.from_user.id):
+        bot.reply_to(message, "❌ Отказано в доступе.")
+        return
+
+    args = message.text.split(maxsplit=2)
+    if len(args) < 2:
+        bot.reply_to(message, "Использование: `/ban <user_id> [причина]`", parse_mode="Markdown")
+        return
+
+    try:
+        target_id = int(args[1])
+        reason = args[2] if len(args) > 2 else "Нарушение правил"
+        
+        conn = get_db()
+        cur = conn.cursor()
+        cur.execute("UPDATE users SET is_banned = 1, ban_reason = ? WHERE user_id = ?", (reason, target_id))
+        conn.commit()
+        conn.close()
+        
+        bot.reply_to(message, f"🚫 Пользователь `{target_id}` заблокирован.\nПричина: {reason}", parse_mode="Markdown")
+    except ValueError:
+        bot.reply_to(message, "❌ Некорректный ID пользователя.")
+
+@bot.message_handler(commands=['unban'])
+def cmd_unban(message):
+    if not is_admin(message.from_user.id):
+        bot.reply_to(message, "❌ Отказано в доступе.")
+        return
+
+    args = message.text.split()
+    if len(args) < 2:
+        bot.reply_to(message, "Использование: `/unban <user_id>`", parse_mode="Markdown")
+        return
+
+    try:
+        target_id = int(args[1])
+        conn = get_db()
+        cur = conn.cursor()
+        cur.execute("UPDATE users SET is_banned = 0, ban_reason = '' WHERE user_id = ?", (target_id,))
+        conn.commit()
+        conn.close()
+        
+        bot.reply_to(message, f"🟢 Пользователь `{target_id}` разблокирован.", parse_mode="Markdown")
+    except ValueError:
+        bot.reply_to(message, "❌ Некорректный ID пользователя.")
+
+@bot.message_handler(commands=['prefix'])
+def cmd_prefix(message):
+    if not is_admin(message.from_user.id):
+        bot.reply_to(message, "❌ Отказано в доступе.")
+        return
+
+    args = message.text.split(maxsplit=3)
+    if len(args) < 3:
+        bot.reply_to(message, "Использование: `/prefix <user_id> <ПРЕФИКС> [цвет_hex]`\nПример: `/prefix 1234567 VIP #ff0000`", parse_mode="Markdown")
+        return
+
+    try:
+        target_id = int(args[1])
+        new_prefix = args[2].upper()
+        color = args[3] if len(args) > 3 else "#888888"
+        
+        conn = get_db()
+        cur = conn.cursor()
+        cur.execute("UPDATE users SET prefix = ?, prefix_color = ? WHERE user_id = ?", (new_prefix, color, target_id))
+        conn.commit()
+        conn.close()
+        
+        bot.reply_to(message, f"🏷 Префикс для `{target_id}` изменен на **{new_prefix}** ({color}).", parse_mode="Markdown")
+    except ValueError:
+        bot.reply_to(message, "❌ Некорректный ID пользователя.")
+
+@bot.message_handler(commands=['alias'])
+def cmd_alias(message):
+    if not is_admin(message.from_user.id):
+        bot.reply_to(message, "❌ Отказано в доступе.")
+        return
+
+    args = message.text.split(maxsplit=2)
+    if len(args) < 3:
+        bot.reply_to(message, "Использование: `/alias <user_id> <алиас1, алиас2>`", parse_mode="Markdown")
+        return
+
+    try:
+        target_id = int(args[1])
+        aliases = args[2]
+        
+        conn = get_db()
+        cur = conn.cursor()
+        cur.execute("UPDATE users SET aliases = ? WHERE user_id = ?", (aliases, target_id))
+        conn.commit()
+        conn.close()
+        
+        bot.reply_to(message, f"👤 Алиасы для `{target_id}` обновлены: {aliases}", parse_mode="Markdown")
+    except ValueError:
+        bot.reply_to(message, "❌ Некорректный ID пользователя.")
+
+@bot.message_handler(commands=['users'])
+def cmd_users(message):
+    if not is_admin(message.from_user.id):
+        bot.reply_to(message, "❌ Отказано в доступе.")
+        return
+
+    conn = get_db()
+    cur = conn.cursor()
+    cur.execute("SELECT user_id, username, first_name, is_invited, is_banned, prefix FROM users ORDER BY user_id DESC LIMIT 10")
+    rows = cur.fetchall()
+    conn.close()
+
+    if not rows:
+        bot.reply_to(message, "База пользователей пуста.")
+        return
+
+    text = "📊 **Последние пользователи:**\n\n"
+    for r in rows:
+        status = "🚫 BAN" if r['is_banned'] else ("✅ INVITED" if r['is_invited'] else "👤 GUEST")
+        text += f"• `{r['user_id']}` | @{r['username'] or 'no_user'} | {r['first_name']} | [{r['prefix']}] | {status}\n"
+
+    bot.reply_to(message, text, parse_mode="Markdown")
+
+# --- HTML / FRONTEND ---
 HTML_TEMPLATE = """
 <!DOCTYPE html>
 <html lang="ru">
@@ -113,30 +281,17 @@ HTML_TEMPLATE = """
             --text-sub: #888888;
             --primary: #ffffff;
             --m3-easing: cubic-bezier(0.2, 0, 0, 1);
-            /* Учитываем отступы Telegram Mini App сверху, чтобы не перекрывалось шапкой */
             --tg-top-inset: var(--tg-content-safe-area-inset-top, env(safe-area-inset-top, 24px));
         }
 
-        * {
-            box-sizing: border-box; margin: 0; padding: 0;
-            font-family: 'Inter', sans-serif;
-            -webkit-tap-highlight-color: transparent;
-        }
+        * { box-sizing: border-box; margin: 0; padding: 0; font-family: 'Inter', sans-serif; -webkit-tap-highlight-color: transparent; }
+        body { background-color: var(--bg); color: var(--text); overflow: hidden; }
 
-        body {
-            background-color: var(--bg); color: var(--text);
-            overflow: hidden;
-        }
-
-        /* --- АНИМАЦИИ --- */
         @keyframes fadeIn { from { opacity: 0; } to { opacity: 1; } }
-        @keyframes fadeOut { from { opacity: 1; } to { opacity: 0; } }
         @keyframes slideInUp { from { transform: translateY(20px); opacity: 0; } to { transform: translateY(0); opacity: 1; } }
-        
         .anim-fade { animation: fadeIn 0.3s var(--m3-easing) forwards; }
         .anim-slide-up { animation: slideInUp 0.4s var(--m3-easing) forwards; }
 
-        /* --- СТАРТОВЫЕ ЭКРАНЫ (ONBOARDING) --- */
         #onboarding-screen {
             position: fixed; inset: 0; background: #000; z-index: 9999;
             display: flex; flex-direction: column; align-items: center; justify-content: center;
@@ -144,67 +299,49 @@ HTML_TEMPLATE = """
         }
         #onboarding-screen.hidden { opacity: 0; pointer-events: none; }
         
-        .onboarding-step {
-            display: none; flex-direction: column; align-items: flex-start; justify-content: center;
-            width: 100%; max-width: 400px;
-        }
+        .onboarding-step { display: none; flex-direction: column; align-items: flex-start; justify-content: center; width: 100%; max-width: 400px; }
         .onboarding-step.active { display: flex; animation: fadeIn 0.4s ease forwards; }
 
         .btn-outline {
             background: transparent; color: var(--text); border: 1px solid var(--text);
-            border-radius: 100px; padding: 12px 24px; font-size: 16px; font-weight: 500;
-            cursor: pointer; transition: 0.2s; align-self: flex-end;
+            border-radius: 100px; padding: 12px 24px; font-size: 16px; font-weight: 500; cursor: pointer; transition: 0.2s; align-self: flex-end;
         }
         .btn-outline:active { background: #222; }
 
-        /* Экран блокировки (Бан) */
         #banned-screen {
             position: fixed; inset: 0; background: #000; z-index: 9998; display: none;
             flex-direction: column; align-items: center; justify-content: center; padding: 24px; text-align: center;
         }
 
-        /* Viewport */
-        .viewport {
-            position: relative; width: 100vw; height: 100vh; overflow: hidden;
-        }
-
+        .viewport { position: relative; width: 100vw; height: 100vh; overflow: hidden; }
         .page {
             position: absolute; top: 0; left: 0; width: 100%; height: 100%;
             background: var(--bg); overflow-y: auto;
             transform: translateX(100%); transition: transform 0.35s var(--m3-easing);
             z-index: 10; display: flex; flex-direction: column;
         }
-        
         .page.active { transform: translateX(0); z-index: 20; }
         .page.base { transform: translateX(0); z-index: 1; }
         .page.dimmed { transform: translateX(-20%); opacity: 0.5; filter: blur(4px); transition: 0.35s; }
 
-        /* Top Bar с учетом Safe Area */
         .top-bar {
             position: sticky; top: 0; background: rgba(0,0,0,0.85); backdrop-filter: blur(16px);
             padding: calc(16px + var(--tg-top-inset)) 20px 16px 20px; 
-            display: flex; align-items: center; gap: 16px; z-index: 100;
-            border-bottom: 1px solid var(--border);
+            display: flex; align-items: center; gap: 16px; z-index: 100; border-bottom: 1px solid var(--border);
         }
         .top-bar .title { font-size: 20px; font-weight: 700; flex: 1; }
-        .icon-btn {
-            background: none; border: none; color: var(--text); cursor: pointer;
-            display: flex; align-items: center; justify-content: center;
-        }
+        .icon-btn { background: none; border: none; color: var(--text); cursor: pointer; display: flex; align-items: center; justify-content: center; }
 
-        /* Feed */
         .feed-container { padding: 16px; padding-bottom: 90px; }
         .post-card {
             background: var(--surface); border: 1px solid var(--border); border-radius: 20px;
-            padding: 20px; margin-bottom: 16px; cursor: pointer;
-            transition: transform 0.1s var(--m3-easing), border-color 0.2s;
+            padding: 20px; margin-bottom: 16px; cursor: pointer; transition: transform 0.1s var(--m3-easing), border-color 0.2s;
         }
         .post-card:active { transform: scale(0.98); border-color: #444; }
         .post-card h2 { font-size: 24px; font-weight: 700; line-height: 1.2; margin-bottom: 8px; letter-spacing: -0.5px; }
         .post-card p {
             color: var(--text-sub); font-size: 15px; line-height: 1.4;
-            display: -webkit-box; -webkit-line-clamp: 2; -webkit-box-orient: vertical; overflow: hidden;
-            margin-bottom: 16px;
+            display: -webkit-box; -webkit-line-clamp: 2; -webkit-box-orient: vertical; overflow: hidden; margin-bottom: 16px;
         }
         
         .author-row { display: flex; align-items: center; gap: 10px; flex-wrap: wrap; }
@@ -218,20 +355,17 @@ HTML_TEMPLATE = """
         .author-name { font-size: 14px; font-weight: 600; color: var(--text); display: flex; align-items: center; gap: 4px; }
         .badge { font-size: 10px; font-weight: 700; padding: 2px 6px; border-radius: 6px; text-transform: uppercase; }
 
-        /* Post Content */
         .post-content-area { padding: 20px; flex: 1; }
         .post-content-area h1 { font-size: 32px; font-weight: 700; line-height: 1.1; margin-bottom: 16px; letter-spacing: -1px; }
         .post-text { font-size: 16px; line-height: 1.6; color: #ddd; white-space: pre-wrap; margin-bottom: 24px; }
         .post-image { width: 100%; border-radius: 16px; margin-bottom: 24px; border: 1px solid var(--border); }
         
-        /* Comments */
         .comments-section { border-top: 1px solid var(--border); padding-top: 24px; }
         .comment-item { display: flex; gap: 12px; margin-bottom: 20px; }
         .comment-bubble { background: var(--surface-variant); padding: 12px 16px; border-radius: 4px 16px 16px 16px; flex: 1; }
         .comment-author { font-size: 13px; font-weight: 600; margin-bottom: 4px; display: flex; align-items: center; gap: 8px; }
         .comment-text { font-size: 14px; line-height: 1.5; color: #ccc; }
 
-        /* Inputs & FAB */
         .input-m3 {
             width: 100%; background: var(--surface-variant); border: 1px solid var(--border);
             border-radius: 16px; padding: 16px; color: #fff; font-size: 15px; outline: none; margin-bottom: 16px;
@@ -260,7 +394,6 @@ HTML_TEMPLATE = """
         .m3-switch:checked { background: var(--primary); }
         .m3-switch:checked::after { transform: translateX(20px); background: #000; }
 
-        /* Profile Styles */
         .profile-header { text-align: center; padding: 30px 20px 20px; position: relative; }
         .profile-avatar-large { width: 90px; height: 90px; border-radius: 50%; object-fit: cover; margin-bottom: 12px; background: #222; }
         .profile-name { font-size: 24px; font-weight: 700; display: flex; justify-content: center; align-items: center; gap: 8px; }
@@ -272,12 +405,8 @@ HTML_TEMPLATE = """
         }
         .banned-text { color: #ff5252; font-style: italic; }
 
-        .bg-emoji-layer {
-            position: fixed; inset: 0; pointer-events: none; z-index: -1; overflow: hidden; opacity: 0.15;
-        }
-        .floating-emoji {
-            position: absolute; font-size: 24px; animation: floatUp linear infinite;
-        }
+        .bg-emoji-layer { position: fixed; inset: 0; pointer-events: none; z-index: -1; overflow: hidden; opacity: 0.15; }
+        .floating-emoji { position: absolute; font-size: 24px; animation: floatUp linear infinite; }
         @keyframes floatUp {
             0% { transform: translateY(110vh) rotate(0deg); }
             100% { transform: translateY(-10vh) rotate(360deg); }
@@ -287,7 +416,6 @@ HTML_TEMPLATE = """
 <body>
 
     <div id="onboarding-screen">
-        
         <div id="step-welcome" class="onboarding-step active">
             <h1 style="font-size: 32px; font-weight: 700; margin-bottom: 8px;">welcome, <span id="welcome-name">guest</span></h1>
             <p style="color: var(--text-sub); margin-bottom: 32px;">let's start! aether's</p>
@@ -310,7 +438,6 @@ HTML_TEMPLATE = """
                 <button class="btn-primary" style="flex: 1; padding: 12px;" onclick="confirmStartInvite()">confirm</button>
             </div>
         </div>
-
     </div>
 
     <div id="banned-screen">
@@ -473,10 +600,8 @@ HTML_TEMPLATE = """
             is_invited: 0
         };
 
-        // Устанавливаем имя в приветствии
         document.getElementById('welcome-name').innerText = currentUser.first_name.toLowerCase();
 
-        // --- ЛОКАЛЬНАЯ БАЗА (LocalStorage) ---
         function getLocalCache(key, defaultVal) {
             const val = localStorage.getItem('aether_' + key);
             return val ? JSON.parse(val) : defaultVal;
@@ -485,7 +610,6 @@ HTML_TEMPLATE = """
             localStorage.setItem('aether_' + key, JSON.stringify(val));
         }
 
-        // --- ONBOARDING ЛОГИКА ---
         let captchaAnswer = 0;
         function generateCaptcha() {
             const num1 = Math.floor(Math.random() * 10) + 1;
@@ -495,9 +619,7 @@ HTML_TEMPLATE = """
         }
 
         function goToStep(stepId) {
-            document.querySelectorAll('.onboarding-step').forEach(el => {
-                el.classList.remove('active');
-            });
+            document.querySelectorAll('.onboarding-step').forEach(el => el.classList.remove('active'));
             if(stepId === 'step-captcha') generateCaptcha();
             document.getElementById(stepId).classList.add('active');
         }
@@ -522,9 +644,7 @@ HTML_TEMPLATE = """
             const code = document.getElementById('start-invite-input').value.trim();
             if(!code) return;
             const success = await processInviteCode(code);
-            if (success) {
-                finishOnboarding();
-            }
+            if (success) finishOnboarding();
         }
 
         function finishOnboarding() {
@@ -532,7 +652,6 @@ HTML_TEMPLATE = """
             initApp();
         }
 
-        // --- ОСНОВНОЕ ПРИЛОЖЕНИЕ ---
         let currentActivePostId = null;
 
         function openPage(pageId, anim = 'anim-slide-up') {
@@ -659,9 +778,7 @@ HTML_TEMPLATE = """
             try {
                 const res = await fetch(`/api/posts/${id}`);
                 data = await res.json();
-            } catch(e) {
-                return;
-            }
+            } catch(e) { return; }
             const p = data.post;
             
             document.getElementById('view-title').innerText = p.title;
@@ -858,9 +975,7 @@ HTML_TEMPLATE = """
             const code = document.getElementById(inputId).value.trim();
             if(!code) return;
             const success = await processInviteCode(code);
-            if (success) {
-                openMyProfile();
-            }
+            if (success) openMyProfile();
         }
     </script>
 </body>
@@ -879,7 +994,7 @@ def sync_user():
     if not user_id:
         return jsonify({"error": "No ID provided"}), 400
 
-    conn = get_db_connection()
+    conn = get_db()
     cur = conn.cursor()
     cur.execute("INSERT OR IGNORE INTO users (user_id, username, first_name, avatar_url) VALUES (?, ?, ?, ?)",
                 (user_id, data.get('username', ''), data.get('first_name', ''), data.get('avatar_url', '')))
@@ -897,7 +1012,7 @@ def sync_user():
 def update_user():
     data = request.json or {}
     user_id = data.get('id') or data.get('user_id')
-    conn = get_db_connection()
+    conn = get_db()
     cur = conn.cursor()
     cur.execute("""
         UPDATE users SET bg_color = ?, bg_emoji = ?, bg_emoji_speed = ?, avatar_frame = ?, nickname_color = ?, status_badge = ?
@@ -909,7 +1024,7 @@ def update_user():
 
 @app.route('/api/user/<int:user_id>')
 def get_user_profile(user_id):
-    conn = get_db_connection()
+    conn = get_db()
     cur = conn.cursor()
     cur.execute("SELECT * FROM users WHERE user_id = ?", (user_id,))
     u = cur.fetchone()
@@ -924,7 +1039,7 @@ def use_invite():
     code = data.get('code', '').strip()
     user_id = data.get('user_id')
     
-    conn = get_db_connection()
+    conn = get_db()
     cur = conn.cursor()
     cur.execute("SELECT is_used FROM invites WHERE code = ?", (code,))
     invite = cur.fetchone()
@@ -942,7 +1057,7 @@ def use_invite():
 @app.route('/api/posts')
 def get_posts():
     q = request.args.get('q', '').strip()
-    conn = get_db_connection()
+    conn = get_db()
     cur = conn.cursor()
     
     query = """
@@ -966,7 +1081,7 @@ def get_posts():
 
 @app.route('/api/posts/<int:post_id>')
 def get_post_detail(post_id):
-    conn = get_db_connection()
+    conn = get_db()
     cur = conn.cursor()
     
     cur.execute("""
@@ -992,7 +1107,7 @@ def get_post_detail(post_id):
 @app.route('/api/posts/create', methods=['POST'])
 def create_post():
     data = request.json or {}
-    conn = get_db_connection()
+    conn = get_db()
     cur = conn.cursor()
     cur.execute("INSERT INTO posts (author_id, title, content, image_url, allow_comments) VALUES (?, ?, ?, ?, ?)",
                 (data.get('author_id'), data.get('title'), data.get('content'), data.get('image_url', ''), data.get('allow_comments', 1)))
@@ -1003,7 +1118,7 @@ def create_post():
 @app.route('/api/posts/<int:post_id>/comment', methods=['POST'])
 def add_comment(post_id):
     data = request.json or {}
-    conn = get_db_connection()
+    conn = get_db()
     cur = conn.cursor()
     cur.execute("INSERT INTO comments (post_id, author_id, content) VALUES (?, ?, ?)",
                 (post_id, data.get('author_id'), data.get('content')))
@@ -1011,5 +1126,16 @@ def add_comment(post_id):
     conn.close()
     return jsonify({"status": "ok"})
 
+# Запуск бота в отдельном потоке (работает при запуске локально/на VPS)
+def start_bot():
+    if BOT_TOKEN and BOT_TOKEN != "YOUR_BOT_TOKEN_HERE":
+        try:
+            print("Telegram Bot polling started...")
+            bot.infinity_polling(skip_pending=True)
+        except Exception as e:
+            print(f"Bot Error: {e}")
+
 if __name__ == '__main__':
+    bot_thread = threading.Thread(target=start_bot, daemon=True)
+    bot_thread.start()
     app.run(host='0.0.0.0', port=5000, debug=True)
