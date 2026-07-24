@@ -8,14 +8,14 @@ from flask import Flask, render_template_string, request, jsonify, redirect
 BOT_TOKEN = os.getenv("BOT_TOKEN", "YOUR_BOT_TOKEN_HERE")
 bot = telebot.TeleBot(BOT_TOKEN, threaded=False)
 
-DB_PATH = "/tmp/aether.db" if os.getenv("VERCEL") else "aether.db"
+DB_PATH = "aether.db"
 app = Flask(__name__)
 
-# --- БАЗА ДАННЫХ ---
+# --- БАЗА ДАННЫХ С ЛОКАЛЬНЫМ КЭШЕМ И РАСШИРЕННЫМИ ПРОФИЛЯМИ ---
 def init_db():
     conn = sqlite3.connect(DB_PATH)
     cur = conn.cursor()
-    # Таблица пользователей
+    
     cur.execute('''
         CREATE TABLE IF NOT EXISTS users (
             user_id INTEGER PRIMARY KEY,
@@ -25,18 +25,28 @@ def init_db():
             is_invited INTEGER DEFAULT 0,
             used_code TEXT DEFAULT '',
             is_banned INTEGER DEFAULT 0,
+            ban_reason TEXT DEFAULT '',
+            ban_until TEXT DEFAULT '',
             prefix TEXT DEFAULT 'USER',
             prefix_color TEXT DEFAULT '#888888',
-            aliases TEXT DEFAULT ''
+            aliases TEXT DEFAULT '',
+            bg_color TEXT DEFAULT '#0a0a0a',
+            bg_emoji TEXT DEFAULT '',
+            bg_emoji_speed TEXT DEFAULT 'normal',
+            avatar_frame TEXT DEFAULT 'none',
+            nickname_color TEXT DEFAULT '#ffffff',
+            status_badge TEXT DEFAULT '',
+            status_type TEXT DEFAULT 'emoji'
         )
     ''')
+    
     cur.execute('''
         CREATE TABLE IF NOT EXISTS invites (
             code TEXT PRIMARY KEY,
             is_used INTEGER DEFAULT 0
         )
     ''')
-    # Таблицы постов и комментов теперь ссылаются только на author_id
+    
     cur.execute('''
         CREATE TABLE IF NOT EXISTS posts (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -49,6 +59,7 @@ def init_db():
             created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
         )
     ''')
+    
     cur.execute('''
         CREATE TABLE IF NOT EXISTS comments (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -58,6 +69,7 @@ def init_db():
             created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
         )
     ''')
+    
     conn.commit()
     conn.close()
 
@@ -66,13 +78,13 @@ init_db()
 def generate_code(length=8):
     return 'AETHER-' + ''.join(random.choices(string.ascii_uppercase + string.digits, k=length))
 
-# --- HTML TEMPLATE (Single Page App) ---
+# --- HTML / CSS / JS (SPA с M3, анимациями, Safe Area, SplashScreen и Customization) ---
 HTML_TEMPLATE = """
 <!DOCTYPE html>
 <html lang="ru">
 <head>
     <meta charset="UTF-8">
-    <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no, viewport-fit=cover">
     <title>aether's</title>
     <script src="https://telegram.org/js/telegram-web-app.js"></script>
     <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&display=swap" rel="stylesheet">
@@ -87,6 +99,8 @@ HTML_TEMPLATE = """
             --text-sub: #888888;
             --primary: #ffffff;
             --m3-easing: cubic-bezier(0.2, 0, 0, 1);
+            /* Учитываем отступы Telegram Mini App сверху, чтобы не перекрывалось шапкой */
+            --tg-top-inset: var(--tg-content-safe-area-inset-top, env(safe-area-inset-top, 20px));
         }
 
         * {
@@ -97,31 +111,61 @@ HTML_TEMPLATE = """
 
         body {
             background-color: var(--bg); color: var(--text);
-            overflow: hidden; /* Запрещаем скролл body, скроллим внутри страниц */
+            overflow: hidden;
+            padding-top: var(--tg-top-inset);
         }
 
-        /* Навигация по страницам (Свайпы как в ТГ/Почте) */
+        /* --- АНИМАЦИИ ПОРТАЛА --- */
+        @keyframes fadeIn { from { opacity: 0; } to { opacity: 1; } }
+        @keyframes fadeOut { from { opacity: 1; } to { opacity: 0; } }
+        @keyframes bounceIn { 
+            0% { transform: scale(0.3); opacity: 0; }
+            50% { transform: scale(1.05); opacity: 1; }
+            70% { transform: scale(0.9); }
+            100% { transform: scale(1); }
+        }
+        @keyframes rollIn {
+            0% { transform: translateX(-100%) rotate(-120deg); opacity: 0; }
+            100% { transform: translateX(0) rotate(0deg); opacity: 1; }
+        }
+
+        .anim-fade { animation: fadeIn 0.3s var(--m3-easing) forwards; }
+        .anim-bounce { animation: bounceIn 0.4s var(--m3-easing) forwards; }
+        .anim-roll { animation: rollIn 0.4s var(--m3-easing) forwards; }
+
+        /* SplashScreen (Начальный экран START) */
+        #splash-screen {
+            position: fixed; inset: 0; background: #000; z-index: 9999;
+            display: flex; flex-direction: column; align-items: center; justify-content: center;
+            transition: opacity 0.4s ease;
+        }
+        #splash-screen.hidden { opacity: 0; pointer-events: none; }
+
+        /* Экран блокировки (Бан) */
+        #banned-screen {
+            position: fixed; inset: 0; background: #000; z-index: 9998; display: none;
+            flex-direction: column; align-items: center; justify-content: center; padding: 24px; text-align: center;
+        }
+
+        /* Viewport */
         .viewport {
-            position: relative; width: 100vw; height: 100vh; overflow: hidden;
+            position: relative; width: 100vw; height: calc(100vh - var(--tg-top-inset)); overflow: hidden;
         }
 
         .page {
             position: absolute; top: 0; left: 0; width: 100%; height: 100%;
-            background: var(--bg);
-            overflow-y: auto;
-            transform: translateX(100%);
-            transition: transform 0.35s var(--m3-easing);
-            z-index: 10;
-            display: flex; flex-direction: column;
+            background: var(--bg); overflow-y: auto;
+            transform: translateX(100%); transition: transform 0.35s var(--m3-easing);
+            z-index: 10; display: flex; flex-direction: column;
         }
         
         .page.active { transform: translateX(0); z-index: 20; }
         .page.base { transform: translateX(0); z-index: 1; }
-        .page.dimmed { transform: translateX(-20%); opacity: 0.5; } /* Эффект ухода на задний план */
+        .page.dimmed { transform: translateX(-20%); opacity: 0.5; filter: blur(4px); transition: 0.35s; }
 
-        /* Топ-бары */
+        /* Top Bar */
         .top-bar {
-            position: sticky; top: 0; background: rgba(0,0,0,0.85); backdrop-filter: blur(12px);
+            position: sticky; top: 0; background: rgba(0,0,0,0.85); backdrop-filter: blur(16px);
             padding: 16px 20px; display: flex; align-items: center; gap: 16px; z-index: 100;
             border-bottom: 1px solid var(--border);
         }
@@ -131,16 +175,14 @@ HTML_TEMPLATE = """
             display: flex; align-items: center; justify-content: center;
         }
 
-        /* Лента форума */
-        .feed-container { padding: 16px; padding-bottom: 80px; }
-        
+        /* Feed */
+        .feed-container { padding: 16px; padding-bottom: 90px; }
         .post-card {
             background: var(--surface); border: 1px solid var(--border); border-radius: 20px;
             padding: 20px; margin-bottom: 16px; cursor: pointer;
             transition: transform 0.1s var(--m3-easing), border-color 0.2s;
         }
         .post-card:active { transform: scale(0.98); border-color: #444; }
-        
         .post-card h2 { font-size: 24px; font-weight: 700; line-height: 1.2; margin-bottom: 8px; letter-spacing: -0.5px; }
         .post-card p {
             color: var(--text-sub); font-size: 15px; line-height: 1.4;
@@ -148,26 +190,32 @@ HTML_TEMPLATE = """
             margin-bottom: 16px;
         }
         
-        .author-row { display: flex; align-items: center; gap: 10px; }
-        .avatar { width: 28px; height: 28px; border-radius: 50%; background: #222; object-fit: cover; }
-        .author-name { font-size: 14px; font-weight: 600; color: var(--text); }
+        .author-row { display: flex; align-items: center; gap: 10px; flex-wrap: wrap; }
+        .avatar-container { position: relative; width: 32px; height: 32px; }
+        .avatar { width: 100%; height: 100%; border-radius: 50%; background: #222; object-fit: cover; }
+        
+        /* Рамки аватарок */
+        .frame-neon { box-shadow: 0 0 10px #fff, inset 0 0 5px #fff; border: 2px solid #fff; }
+        .frame-gold { box-shadow: 0 0 12px #ffd700; border: 2px solid #ffd700; }
+        .frame-fire { box-shadow: 0 0 12px #ff4500; border: 2px solid #ff4500; }
+
+        .author-name { font-size: 14px; font-weight: 600; color: var(--text); display: flex; align-items: center; gap: 4px; }
         .badge { font-size: 10px; font-weight: 700; padding: 2px 6px; border-radius: 6px; text-transform: uppercase; }
 
-        /* Внутренности поста */
+        /* Post Content */
         .post-content-area { padding: 20px; flex: 1; }
         .post-content-area h1 { font-size: 32px; font-weight: 700; line-height: 1.1; margin-bottom: 16px; letter-spacing: -1px; }
         .post-text { font-size: 16px; line-height: 1.6; color: #ddd; white-space: pre-wrap; margin-bottom: 24px; }
         .post-image { width: 100%; border-radius: 16px; margin-bottom: 24px; border: 1px solid var(--border); }
         
-        /* Комментарии */
+        /* Comments */
         .comments-section { border-top: 1px solid var(--border); padding-top: 24px; }
         .comment-item { display: flex; gap: 12px; margin-bottom: 20px; }
-        .comment-item .avatar { width: 36px; height: 36px; }
         .comment-bubble { background: var(--surface-variant); padding: 12px 16px; border-radius: 4px 16px 16px 16px; flex: 1; }
         .comment-author { font-size: 13px; font-weight: 600; margin-bottom: 4px; display: flex; align-items: center; gap: 8px; }
         .comment-text { font-size: 14px; line-height: 1.5; color: #ccc; }
 
-        /* M3 Input & FAB */
+        /* Inputs & FAB */
         .input-m3 {
             width: 100%; background: var(--surface-variant); border: 1px solid var(--border);
             border-radius: 16px; padding: 16px; color: #fff; font-size: 15px; outline: none; margin-bottom: 16px;
@@ -181,15 +229,13 @@ HTML_TEMPLATE = """
             box-shadow: 0 8px 24px rgba(255,255,255,0.15); z-index: 50; cursor: pointer;
         }
 
-        /* M3 Switch (Чекбокс) */
         .m3-switch-container {
             display: flex; justify-content: space-between; align-items: center;
             background: var(--surface); padding: 16px; border-radius: 16px; border: 1px solid var(--border); margin-bottom: 24px;
         }
         .m3-switch {
             position: relative; width: 52px; height: 32px; appearance: none;
-            background: var(--border); border-radius: 100px; outline: none; cursor: pointer;
-            transition: background 0.3s;
+            background: var(--border); border-radius: 100px; outline: none; cursor: pointer; transition: background 0.3s;
         }
         .m3-switch::after {
             content: ''; position: absolute; top: 4px; left: 4px; width: 24px; height: 24px;
@@ -198,24 +244,52 @@ HTML_TEMPLATE = """
         .m3-switch:checked { background: var(--primary); }
         .m3-switch:checked::after { transform: translateX(20px); background: #000; }
 
-        /* Профиль (Стиль ТГ) */
-        .profile-header { text-align: center; padding: 40px 20px 20px; }
-        .profile-avatar { width: 100px; height: 100px; border-radius: 50%; object-fit: cover; margin-bottom: 16px; background: #222; }
+        /* Profile Styles */
+        .profile-header { text-align: center; padding: 30px 20px 20px; position: relative; }
+        .profile-avatar-large { width: 90px; height: 90px; border-radius: 50%; object-fit: cover; margin-bottom: 12px; background: #222; }
         .profile-name { font-size: 24px; font-weight: 700; display: flex; justify-content: center; align-items: center; gap: 8px; }
-        .profile-box { background: var(--surface); border: 1px solid var(--border); border-radius: 16px; padding: 16px; margin: 0 20px; }
+        .profile-box { background: var(--surface); border: 1px solid var(--border); border-radius: 16px; padding: 16px; margin: 0 20px 16px; }
 
         .btn-primary {
             background: var(--primary); color: #000; border: none; border-radius: 100px;
             padding: 16px; font-size: 16px; font-weight: 600; width: 100%; cursor: pointer;
         }
-        
         .banned-text { color: #ff5252; font-style: italic; }
+
+        /* Фоновые эмодзи */
+        .bg-emoji-layer {
+            position: fixed; inset: 0; pointer-events: none; z-index: -1; overflow: hidden; opacity: 0.15;
+        }
+        .floating-emoji {
+            position: absolute; font-size: 24px; animation: floatUp linear infinite;
+        }
+        @keyframes floatUp {
+            0% { transform: translateY(110vh) rotate(0deg); }
+            100% { transform: translateY(-10vh) rotate(360deg); }
+        }
     </style>
 </head>
 <body>
 
+    <!-- СПЛЭШ СКРИН (START) -->
+    <div id="splash-screen">
+        <h1 style="font-size: 32px; font-weight: 700; margin-bottom: 24px; letter-spacing: -1px;">aether's</h1>
+        <button class="btn-primary" style="width: 200px;" onclick="startApp()">START</button>
+    </div>
+
+    <!-- ЭКРАН БЛОКИРОВКИ -->
+    <div id="banned-screen">
+        <span class="material-symbols-rounded" style="font-size: 64px; color: #ff5252; margin-bottom: 16px;">block</span>
+        <h2 style="font-size: 24px; font-weight: 700; margin-bottom: 8px;">Access Restricted</h2>
+        <p id="ban-reason-text" style="color: var(--text-sub); margin-bottom: 8px; font-size: 15px;"></p>
+        <p id="ban-until-text" style="color: #ff5252; font-size: 13px;"></p>
+    </div>
+
+    <!-- ФОНОВЫЕ ЭМОДЗИ -->
+    <div class="bg-emoji-layer" id="bg-emoji-layer"></div>
+
     <div class="viewport">
-        <!-- БАЗОВАЯ СТРАНИЦА (ЛЕНТА) -->
+        <!-- ЛЕНТА -->
         <div id="page-feed" class="page base">
             <div class="top-bar">
                 <span class="title">aether's</span>
@@ -227,14 +301,12 @@ HTML_TEMPLATE = """
                 <input type="text" id="search-input" class="input-m3" placeholder="Search topics..." oninput="loadFeed()">
             </div>
 
-            <div class="feed-container" id="feed-list">
-                <!-- Карточки загружаются сюда -->
-            </div>
+            <div class="feed-container" id="feed-list"></div>
             
             <div class="fab" onclick="openCreatePost()"><span class="material-symbols-rounded">edit</span></div>
         </div>
 
-        <!-- СТРАНИЦА: ПРОСМОТР ПОСТА -->
+        <!-- ПРОСМОТР ПОСТА -->
         <div id="page-post" class="page">
             <div class="top-bar">
                 <div class="icon-btn" onclick="closePage('page-post')"><span class="material-symbols-rounded">arrow_back</span></div>
@@ -243,7 +315,7 @@ HTML_TEMPLATE = """
             <div class="post-content-area">
                 <h1 id="view-title">Loading...</h1>
                 <div class="author-row" style="margin-bottom: 24px; cursor: pointer;" id="view-author-trigger">
-                    <img id="view-avatar" class="avatar" src="">
+                    <div class="avatar-container" id="view-avatar-wrap"><img id="view-avatar" class="avatar" src=""></div>
                     <span id="view-author" class="author-name">...</span>
                     <span id="view-badge" class="badge"></span>
                 </div>
@@ -265,7 +337,7 @@ HTML_TEMPLATE = """
             </div>
         </div>
 
-        <!-- СТРАНИЦА: СОЗДАНИЕ ПОСТА -->
+        <!-- СОЗДАНИЕ ПОСТА -->
         <div id="page-create" class="page">
             <div class="top-bar">
                 <div class="icon-btn" onclick="closePage('page-create')"><span class="material-symbols-rounded">close</span></div>
@@ -288,17 +360,22 @@ HTML_TEMPLATE = """
             </div>
         </div>
 
-        <!-- СТРАНИЦА: ПРОФИЛЬ (ТГ СТИЛЬ) -->
+        <!-- ПРОФИЛЬ -->
         <div id="page-profile" class="page">
             <div class="top-bar">
                 <div class="icon-btn" onclick="closePage('page-profile')"><span class="material-symbols-rounded">arrow_back</span></div>
                 <span class="title">Profile</span>
+                <div class="icon-btn" id="edit-profile-btn" style="display: none;" onclick="openEditProfile()"><span class="material-symbols-rounded">edit</span></div>
             </div>
+            
             <div class="profile-header">
-                <img id="prof-avatar" class="profile-avatar" src="">
+                <div class="avatar-container" style="width: 90px; height: 90px; margin: 0 auto 12px;" id="prof-avatar-wrap">
+                    <img id="prof-avatar" class="profile-avatar-large" src="" style="width:100%; height:100%;">
+                </div>
                 <div class="profile-name">
                     <span id="prof-name">Name</span>
                     <span id="prof-badge" class="badge"></span>
+                    <span id="prof-status-view"></span>
                 </div>
                 <div style="color: var(--text-sub); margin-top: 8px;" id="prof-username">@username</div>
             </div>
@@ -311,10 +388,41 @@ HTML_TEMPLATE = """
                 <div id="prof-aliases" style="font-size: 15px; color: #fff;">None</div>
             </div>
             
-            <div id="invite-section" class="profile-box" style="margin-top: 16px; display: none;">
-                <div style="font-size: 12px; color: var(--text-sub); margin-bottom: 8px;">Enter Invite Code</div>
+            <div id="invite-section" class="profile-box" style="display: none;">
+                <div style="font-size: 12px; color: var(--text-sub); margin-bottom: 8px;">Activate Invite Code</div>
                 <input type="text" id="invite-code-input" class="input-m3" style="padding: 10px; margin-bottom: 10px;" placeholder="AETHER-XXXXX">
                 <button class="btn-primary" style="padding: 10px;" onclick="useInvite()">Activate</button>
+            </div>
+        </div>
+
+        <!-- РЕДАКТИРОВАНИЕ ПРОФИЛЯ (Кастомизация для инвайтнутых) -->
+        <div id="page-edit-profile" class="page">
+            <div class="top-bar">
+                <div class="icon-btn" onclick="closePage('page-edit-profile')"><span class="material-symbols-rounded">arrow_back</span></div>
+                <span class="title">Customize Profile</span>
+            </div>
+            <div class="post-content-area">
+                <label style="font-size: 13px; color: var(--text-sub);">Background Color (HEX)</label>
+                <input type="text" id="edit-bg-color" class="input-m3" placeholder="#0a0a0a">
+                
+                <label style="font-size: 13px; color: var(--text-sub);">Background Emoji</label>
+                <input type="text" id="edit-bg-emoji" class="input-m3" placeholder="🔥">
+                
+                <label style="font-size: 13px; color: var(--text-sub);">Avatar Frame</label>
+                <select id="edit-avatar-frame" class="input-m3">
+                    <option value="none">None</option>
+                    <option value="neon">Neon White</option>
+                    <option value="gold">Gold</option>
+                    <option value="fire">Fire</option>
+                </select>
+
+                <label style="font-size: 13px; color: var(--text-sub);">Nickname Color (HEX)</label>
+                <input type="text" id="edit-nick-color" class="input-m3" placeholder="#ffffff">
+
+                <label style="font-size: 13px; color: var(--text-sub);">Status Icon / GIF (URL or Emoji)</label>
+                <input type="text" id="edit-status" class="input-m3" placeholder="⚡ or https://...">
+
+                <button class="btn-primary" onclick="saveCustomization()">Save Changes</button>
             </div>
         </div>
     </div>
@@ -324,30 +432,41 @@ HTML_TEMPLATE = """
         if(tg) { tg.expand(); tg.ready(); }
 
         let currentUser = {
-            id: tg?.initDataUnsafe?.user?.id || 123456,
+            id: tg?.initDataUnsafe?.user?.id || Math.floor(Math.random()*1000000),
             first_name: tg?.initDataUnsafe?.user?.first_name || 'Guest',
             username: tg?.initDataUnsafe?.user?.username || 'guest',
             avatar_url: tg?.initDataUnsafe?.user?.photo_url || '',
             is_invited: 0
         };
 
+        // --- ЛОКАЛЬНАЯ БАЗА (LocalStorage кэш) ---
+        function getLocalCache(key, defaultVal) {
+            const val = localStorage.getItem('aether_' + key);
+            return val ? JSON.parse(val) : defaultVal;
+        }
+        function setLocalCache(key, val) {
+            localStorage.setItem('aether_' + key, JSON.stringify(val));
+        }
+
         let currentActivePostId = null;
 
-        // --- Управление страницами ---
-        function openPage(pageId) {
+        function startApp() {
+            document.getElementById('splash-screen').classList.add('hidden');
+            initApp();
+        }
+
+        function openPage(pageId, anim = 'anim-fade') {
             document.getElementById('page-feed').classList.add('dimmed');
             const page = document.getElementById(pageId);
             page.style.display = 'flex';
-            // Force reflow
-            void page.offsetWidth;
-            page.classList.add('active');
+            page.className = 'page active ' + anim;
         }
 
         function closePage(pageId) {
             document.getElementById('page-feed').classList.remove('dimmed');
             const page = document.getElementById(pageId);
             page.classList.remove('active');
-            setTimeout(() => { if(!page.classList.contains('active')) page.style.display = ''; }, 350);
+            setTimeout(() => { if(!page.classList.contains('active')) page.style.display = 'none'; }, 350);
         }
         
         function openSearch() {
@@ -355,42 +474,97 @@ HTML_TEMPLATE = """
             sb.style.display = sb.style.display === 'none' ? 'block' : 'none';
         }
 
-        // --- API Вызовы ---
         async function initApp() {
-            // Синхронизация юзера с БД
-            const res = await fetch('/api/user/sync', {
-                method: 'POST',
-                headers: {'Content-Type': 'application/json'},
-                body: JSON.stringify(currentUser)
-            });
-            const data = await res.json();
-            currentUser = data.user;
+            try {
+                const res = await fetch('/api/user/sync', {
+                    method: 'POST',
+                    headers: {'Content-Type': 'application/json'},
+                    body: JSON.stringify(currentUser)
+                });
+                const data = await res.json();
+                currentUser = data.user;
+                setLocalCache('user', currentUser);
+            } catch(e) {
+                // Если нет сети, берем из локальной базы
+                currentUser = getLocalCache('user', currentUser);
+            }
+
+            // Проверка бана
+            if(currentUser.is_banned) {
+                document.getElementById('banned-screen').style.display = 'flex';
+                document.getElementById('ban-reason-text').innerText = "Reason: " + (currentUser.ban_reason || "Violation of rules");
+                document.getElementById('ban-until-text').innerText = currentUser.ban_until ? ("Until: " + currentUser.ban_until) : "Permanent Ban";
+                return;
+            }
+
+            applyUserTheme(currentUser);
             loadFeed();
         }
 
+        function applyUserTheme(u) {
+            if(u.bg_color) document.documentElement.style.setProperty('--bg', u.bg_color);
+            if(u.bg_emoji) {
+                const layer = document.getElementById('bg-emoji-layer');
+                layer.innerHTML = '';
+                for(let i=0; i<15; i++) {
+                    const span = document.createElement('span');
+                    span.className = 'floating-emoji';
+                    span.innerText = u.bg_emoji;
+                    span.style.left = Math.random() * 100 + '%';
+                    span.style.top = Math.random() * 100 + '%';
+                    span.style.animationDuration = (5 + Math.random() * 10) + 's';
+                    layer.appendChild(span);
+                }
+            }
+        }
+
+        function getAvatarHTML(u, customClass = '') {
+            const ava = u.avatar_url || 'data:image/svg+xml;utf8,<svg xmlns="http://www.w3.org/2000/svg" fill="%23555" viewBox="0 0 24 24"><path d="M12 12c2.21 0 4-1.79 4-4s-1.79-4-4-4-4 1.79-4 4 1.79 4 4 4zm0 2c-2.67 0-8 1.34-8 4v2h16v-2c0-2.66-5.33-4-8-4z"/></svg>';
+            let frameClass = '';
+            if(u.avatar_frame === 'neon') frameClass = 'frame-neon';
+            if(u.avatar_frame === 'gold') frameClass = 'frame-gold';
+            if(u.avatar_frame === 'fire') frameClass = 'frame-fire';
+
+            return `<div class="avatar-container"><img class="avatar ${frameClass} ${customClass}" src="${ava}"></div>`;
+        }
+
+        function getStatusHTML(u) {
+            if(!u.status_badge) return '';
+            if(u.status_badge.startsWith('http')) {
+                return `<img src="${u.status_badge}" style="width: 16px; height: 16px; object-fit: contain; vertical-align: middle;">`;
+            }
+            return `<span style="font-size: 14px;">${u.status_badge}</span>`;
+        }
+
         async function loadFeed() {
-            const q = document.getElementById('search-input').value.trim();
-            const res = await fetch(`/api/posts?q=${encodeURIComponent(q)}`);
-            const posts = await res.json();
+            const q = document.getElementById('search-input')?.value.trim() || '';
+            let posts = [];
+            try {
+                const res = await fetch(`/api/posts?q=${encodeURIComponent(q)}`);
+                posts = await res.json();
+                setLocalCache('posts', posts);
+            } catch(e) {
+                posts = getLocalCache('posts', []);
+            }
             
             const list = document.getElementById('feed-list');
             list.innerHTML = '';
             
             posts.forEach(p => {
-                // Если забанен
                 const authorName = p.is_banned ? '<span class="banned-text">Account not found</span>' : p.author_name;
-                const avatar = p.is_banned || !p.avatar_url ? 'data:image/svg+xml;utf8,<svg xmlns="http://www.w3.org/2000/svg" fill="%23555" viewBox="0 0 24 24"><path d="M12 12c2.21 0 4-1.79 4-4s-1.79-4-4-4-4 1.79-4 4 1.79 4 4 4zm0 2c-2.67 0-8 1.34-8 4v2h16v-2c0-2.66-5.33-4-8-4z"/></svg>' : p.avatar_url;
+                const nickColor = p.nickname_color || '#fff';
                 const badge = (!p.is_banned && p.prefix) ? `<span class="badge" style="background: ${p.prefix_color}; color: #000;">${p.prefix}</span>` : '';
                 const pin = p.is_pinned ? `<span class="material-symbols-rounded" style="font-size: 16px; float: right; color: var(--text-sub);">push_pin</span>` : '';
+                const status = (!p.is_banned) ? getStatusHTML(p) : '';
 
                 list.innerHTML += `
-                    <div class="post-card" onclick="viewPost(${p.id})">
+                    <div class="post-card anim-fade" onclick="viewPost(${p.id})">
                         ${pin}
                         <h2>${p.title}</h2>
                         <p>${p.content}</p>
                         <div class="author-row">
-                            <img class="avatar" src="${avatar}">
-                            <span class="author-name">${authorName}</span>
+                            ${getAvatarHTML(p)}
+                            <span class="author-name" style="color: ${nickColor};">${authorName} ${status}</span>
                             ${badge}
                         </div>
                     </div>
@@ -400,8 +574,13 @@ HTML_TEMPLATE = """
 
         async function viewPost(id) {
             currentActivePostId = id;
-            const res = await fetch(`/api/posts/${id}`);
-            const data = await res.json();
+            let data = {};
+            try {
+                const res = await fetch(`/api/posts/${id}`);
+                data = await res.json();
+            } catch(e) {
+                return;
+            }
             const p = data.post;
             
             document.getElementById('view-title').innerText = p.title;
@@ -412,17 +591,16 @@ HTML_TEMPLATE = """
             else { img.style.display = 'none'; }
 
             const aName = p.is_banned ? 'Account not found' : p.author_name;
-            const aAva = p.is_banned || !p.avatar_url ? 'data:image/svg+xml;utf8,<svg xmlns="http://www.w3.org/2000/svg" fill="%23555" viewBox="0 0 24 24"><path d="M12 12c2.21 0 4-1.79 4-4s-1.79-4-4-4-4 1.79-4 4 1.79 4 4 4zm0 2c-2.67 0-8 1.34-8 4v2h16v-2c0-2.66-5.33-4-8-4z"/></svg>' : p.avatar_url;
-            
             document.getElementById('view-author').innerText = aName;
+            document.getElementById('view-author').style.color = p.nickname_color || '#fff';
             if(p.is_banned) document.getElementById('view-author').classList.add('banned-text');
             else document.getElementById('view-author').classList.remove('banned-text');
 
-            document.getElementById('view-avatar').src = aAva;
+            document.getElementById('view-avatar-wrap').innerHTML = getAvatarHTML(p);
             
             const badgeEl = document.getElementById('view-badge');
             if(!p.is_banned && p.prefix) {
-                badgeEl.innerText = p.prefix;
+                badgeEl.innerText = p.prefix + ' ' + getStatusHTML(p);
                 badgeEl.style.background = p.prefix_color;
                 badgeEl.style.color = '#000';
                 badgeEl.style.display = 'inline-block';
@@ -430,25 +608,23 @@ HTML_TEMPLATE = """
                 badgeEl.style.display = 'none';
             }
 
-            // Обработчик профиля
             document.getElementById('view-author-trigger').onclick = () => {
                 if(!p.is_banned) openProfile(p.author_id);
             };
 
-            // Комменты
             const cList = document.getElementById('comments-list');
             cList.innerHTML = '';
             data.comments.forEach(c => {
                 const cName = c.is_banned ? '<span class="banned-text">Account not found</span>' : c.author_name;
-                const cAva = c.is_banned || !c.avatar_url ? 'data:image/svg+xml;utf8,<svg xmlns="http://www.w3.org/2000/svg" fill="%23555" viewBox="0 0 24 24"><path d="M12 12c2.21 0 4-1.79 4-4s-1.79-4-4-4-4 1.79-4 4 1.79 4 4 4zm0 2c-2.67 0-8 1.34-8 4v2h16v-2c0-2.66-5.33-4-8-4z"/></svg>' : c.avatar_url;
                 const cBadge = (!c.is_banned && c.prefix) ? `<span class="badge" style="background: ${c.prefix_color}; color: #000; font-size: 8px;">${c.prefix}</span>` : '';
+                const cStatus = (!c.is_banned) ? getStatusHTML(c) : '';
 
                 cList.innerHTML += `
                     <div class="comment-item">
-                        <img class="avatar" src="${cAva}" style="cursor:pointer;" onclick="${c.is_banned ? '' : `openProfile(${c.author_id})`}">
+                        <div onclick="${c.is_banned ? '' : `openProfile(${c.author_id})`}" style="cursor:pointer;">${getAvatarHTML(c)}</div>
                         <div class="comment-bubble">
-                            <div class="comment-author" style="cursor:pointer;" onclick="${c.is_banned ? '' : `openProfile(${c.author_id})`}">
-                                ${cName} ${cBadge}
+                            <div class="comment-author" style="cursor:pointer; color:${c.nickname_color || '#fff'};" onclick="${c.is_banned ? '' : `openProfile(${c.author_id})`}">
+                                ${cName} ${cStatus} ${cBadge}
                             </div>
                             <div class="comment-text">${c.content}</div>
                         </div>
@@ -456,22 +632,17 @@ HTML_TEMPLATE = """
                 `;
             });
 
-            // Форма комментов
-            if(currentUser.is_invited || p.allow_comments) {
-                document.getElementById('comment-input-area').style.display = 'flex';
-            } else {
-                document.getElementById('comment-input-area').style.display = 'none';
-            }
+            document.getElementById('comment-input-area').style.display = (currentUser.is_invited || p.allow_comments) ? 'flex' : 'none';
 
-            openPage('page-post');
+            openPage('page-post', 'anim-bounce');
         }
 
         function openCreatePost() {
             if(!currentUser.is_invited) {
-                tg.showAlert("Posting is limited to verified/invited users.");
+                tg?.showAlert("Posting is limited to verified/invited users.");
                 return;
             }
-            openPage('page-create');
+            openPage('page-create', 'anim-roll');
         }
 
         async function submitPost() {
@@ -486,8 +657,7 @@ HTML_TEMPLATE = """
                 method: 'POST',
                 headers: {'Content-Type': 'application/json'},
                 body: JSON.stringify({
-                    author_id: currentUser.id,
-                    title: title, content: content, image_url: img, allow_comments: allow_comments
+                    author_id: currentUser.id, title, content, image_url: img, allow_comments
                 })
             });
 
@@ -510,7 +680,7 @@ HTML_TEMPLATE = """
             });
 
             inp.value = '';
-            viewPost(currentActivePostId); // refresh
+            viewPost(currentActivePostId);
         }
 
         function openMyProfile() {
@@ -518,17 +688,21 @@ HTML_TEMPLATE = """
         }
 
         async function openProfile(userId, isMe = false) {
-            const res = await fetch(`/api/user/${userId}`);
-            const data = await res.json();
-            if(data.error) return;
-            const u = data.user;
+            let u = currentUser;
+            if(!isMe) {
+                const res = await fetch(`/api/user/${userId}`);
+                const data = await res.json();
+                if(data.error) return;
+                u = data.user;
+            }
 
             document.getElementById('prof-name').innerText = u.first_name;
-            document.getElementById('prof-username').innerText = `@${u.username}`;
+            document.getElementById('prof-name').style.color = u.nickname_color || '#fff';
+            document.getElementById('prof-username').innerText = u.aliases ? u.aliases.split(',').map(a => `@${a.trim()}`).join(', ') : `@${u.username}`;
             document.getElementById('prof-id').innerText = u.user_id;
             
-            const ava = u.avatar_url || 'data:image/svg+xml;utf8,<svg xmlns="http://www.w3.org/2000/svg" fill="%23555" viewBox="0 0 24 24"><path d="M12 12c2.21 0 4-1.79 4-4s-1.79-4-4-4-4 1.79-4 4 1.79 4 4 4zm0 2c-2.67 0-8 1.34-8 4v2h16v-2c0-2.66-5.33-4-8-4z"/></svg>';
-            document.getElementById('prof-avatar').src = ava;
+            document.getElementById('prof-avatar-wrap').innerHTML = getAvatarHTML(u, 'profile-avatar-large');
+            document.getElementById('prof-status-view').innerHTML = getStatusHTML(u);
 
             const badgeEl = document.getElementById('prof-badge');
             if(u.prefix) {
@@ -540,19 +714,43 @@ HTML_TEMPLATE = """
                 badgeEl.style.display = 'none';
             }
 
-            document.getElementById('prof-aliases').innerText = u.aliases ? u.aliases.split(',').map(a => `@${a.trim()}`).join(', ') : 'None';
+            document.getElementById('edit-profile-btn').style.display = (isMe && u.is_invited) ? 'flex' : 'none';
+            document.getElementById('invite-section').style.display = (isMe && !u.is_invited) ? 'block' : 'none';
 
-            if(isMe && !currentUser.is_invited) {
-                document.getElementById('invite-section').style.display = 'block';
-            } else {
-                document.getElementById('invite-section').style.display = 'none';
-            }
+            openPage('page-profile', 'anim-fade');
+        }
 
-            openPage('page-profile');
+        function openEditProfile() {
+            document.getElementById('edit-bg-color').value = currentUser.bg_color || '#0a0a0a';
+            document.getElementById('edit-bg-emoji').value = currentUser.bg_emoji || '';
+            document.getElementById('edit-avatar-frame').value = currentUser.avatar_frame || 'none';
+            document.getElementById('edit-nick-color').value = currentUser.nickname_color || '#ffffff';
+            document.getElementById('edit-status').value = currentUser.status_badge || '';
+            openPage('page-edit-profile', 'anim-bounce');
+        }
+
+        async function saveCustomization() {
+            currentUser.bg_color = document.getElementById('edit-bg-color').value.trim();
+            currentUser.bg_emoji = document.getElementById('edit-bg-emoji').value.trim();
+            currentUser.avatar_frame = document.getElementById('edit-avatar-frame').value;
+            currentUser.nickname_color = document.getElementById('edit-nick-color').value.trim();
+            currentUser.status_badge = document.getElementById('edit-status').value.trim();
+
+            await fetch('/api/user/update', {
+                method: 'POST',
+                headers: {'Content-Type': 'application/json'},
+                body: JSON.stringify(currentUser)
+            });
+
+            setLocalCache('user', currentUser);
+            applyUserTheme(currentUser);
+            closePage('page-edit-profile');
+            openMyProfile();
         }
 
         async function useInvite() {
             const code = document.getElementById('invite-code-input').value.trim();
+            if(!code) return;
             const res = await fetch('/api/invite/use', {
                 method: 'POST',
                 headers: {'Content-Type': 'application/json'},
@@ -561,91 +759,19 @@ HTML_TEMPLATE = """
             const data = await res.json();
             if(data.success) {
                 currentUser.is_invited = 1;
-                tg.showAlert("Access granted!");
+                setLocalCache('user', currentUser);
+                tg?.showAlert("Access granted!");
                 openMyProfile();
             } else {
-                tg.showAlert("Invalid code.");
+                tg?.showAlert("Invalid code.");
             }
         }
-
-        initApp();
     </script>
 </body>
 </html>
 """
 
-# --- ADMIN PANEL HTML ---
-ADMIN_TEMPLATE = """
-<!DOCTYPE html>
-<html>
-<head>
-    <title>Admin Dashboard</title>
-    <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <style>
-        body { background: #000; color: #fff; font-family: sans-serif; padding: 20px; }
-        h1 { font-size: 24px; border-bottom: 1px solid #333; padding-bottom: 10px; }
-        .card { background: #111; border: 1px solid #333; border-radius: 12px; padding: 16px; margin-bottom: 16px; }
-        input, select { background: #000; color: #fff; border: 1px solid #444; padding: 8px; border-radius: 6px; width: 100%; margin-top: 4px; box-sizing: border-box; }
-        button { background: #fff; color: #000; border: none; padding: 10px 16px; border-radius: 6px; font-weight: bold; cursor: pointer; margin-top: 10px; }
-        .btn-danger { background: #ff3b30; color: #fff; }
-        table { width: 100%; border-collapse: collapse; margin-top: 10px; }
-        th, td { text-align: left; padding: 8px; border-bottom: 1px solid #333; }
-        details { cursor: pointer; }
-    </style>
-</head>
-<body>
-    <h1>Administration</h1>
-    
-    <div class="card">
-        <h3>Create Invite</h3>
-        <form action="/inv/generate" method="post">
-            <button type="submit">Generate Code</button>
-        </form>
-    </div>
-
-    <div class="card">
-        <h3>Users Control</h3>
-        <table>
-            <tr><th>ID</th><th>Username</th><th>Prefix</th><th>Banned</th><th>Action</th></tr>
-            {% for u in users %}
-            <tr>
-                <td>{{ u[0] }}</td>
-                <td>{{ u[1] }}</td>
-                <td><span style="color:{{ u[8] }}">{{ u[7] }}</span></td>
-                <td>{{ "YES" if u[6] else "NO" }}</td>
-                <td>
-                    <details>
-                        <summary>Edit</summary>
-                        <div style="background: #000; padding: 10px; margin-top: 5px; border-radius: 6px; border: 1px solid #333;">
-                            <form action="/inv/edit_user" method="post">
-                                <input type="hidden" name="user_id" value="{{ u[0] }}">
-                                <label>Prefix:</label>
-                                <input type="text" name="prefix" value="{{ u[7] }}">
-                                <label>Prefix Color (HEX):</label>
-                                <input type="text" name="prefix_color" value="{{ u[8] }}">
-                                <label>Aliases (comma separated):</label>
-                                <input type="text" name="aliases" value="{{ u[9] }}">
-                                
-                                <div style="display:flex; gap:10px; margin-top:10px;">
-                                    <button type="submit">Save</button>
-                                </div>
-                            </form>
-                            <form action="/inv/ban" method="post" style="margin-top: 5px;">
-                                <input type="hidden" name="user_id" value="{{ u[0] }}">
-                                <button type="submit" class="btn-danger">{{ "Unban User" if u[6] else "Ban User" }}</button>
-                            </form>
-                        </div>
-                    </details>
-                </td>
-            </tr>
-            {% endfor %}
-        </table>
-    </div>
-</body>
-</html>
-"""
-
-# --- ROUTES ---
+# --- PYTHON API ROUTES ---
 @app.route('/')
 def index():
     return render_template_string(HTML_TEMPLATE)
@@ -655,47 +781,69 @@ def sync_user():
     data = request.json
     conn = sqlite3.connect(DB_PATH)
     cur = conn.cursor()
-    # Обновляем инфу при заходе
     cur.execute("INSERT OR IGNORE INTO users (user_id, username, first_name, avatar_url) VALUES (?, ?, ?, ?)",
                 (data['id'], data['username'], data['first_name'], data.get('avatar_url', '')))
     cur.execute("UPDATE users SET avatar_url = ?, username = ?, first_name = ? WHERE user_id = ?", 
                 (data.get('avatar_url', ''), data['username'], data['first_name'], data['id']))
     
-    cur.execute("SELECT user_id, username, first_name, avatar_url, is_invited, used_code, is_banned, prefix, prefix_color, aliases FROM users WHERE user_id = ?", (data['id'],))
+    cur.execute("SELECT user_id, username, first_name, avatar_url, is_invited, used_code, is_banned, ban_reason, ban_until, prefix, prefix_color, aliases, bg_color, bg_emoji, avatar_frame, nickname_color, status_badge FROM users WHERE user_id = ?", (data['id'],))
     u = cur.fetchone()
     conn.commit()
     conn.close()
     
     return jsonify({"user": {
         "id": u[0], "username": u[1], "first_name": u[2], "avatar_url": u[3],
-        "is_invited": u[4], "used_code": u[5], "is_banned": u[6],
-        "prefix": u[7], "prefix_color": u[8], "aliases": u[9]
+        "is_invited": u[4], "used_code": u[5], "is_banned": u[6], "ban_reason": u[7], "ban_until": u[8],
+        "prefix": u[9], "prefix_color": u[10], "aliases": u[11], "bg_color": u[12], "bg_emoji": u[13],
+        "avatar_frame": u[14], "nickname_color": u[15], "status_badge": u[16]
     }})
+
+@app.route('/api/user/update', methods=['POST'])
+def update_user():
+    data = request.json
+    conn = sqlite3.connect(DB_PATH)
+    cur = conn.cursor()
+    cur.execute("""
+        UPDATE users SET bg_color = ?, bg_emoji = ?, avatar_frame = ?, nickname_color = ?, status_badge = ?
+        WHERE user_id = ?
+    """, (data.get('bg_color'), data.get('bg_emoji'), data.get('avatar_frame'), data.get('nickname_color'), data.get('status_badge'), data['id']))
+    conn.commit()
+    conn.close()
+    return jsonify({"status": "ok"})
 
 @app.route('/api/user/<int:user_id>')
 def get_user_profile(user_id):
     conn = sqlite3.connect(DB_PATH)
     cur = conn.cursor()
-    cur.execute("SELECT user_id, username, first_name, avatar_url, prefix, prefix_color, aliases, is_banned FROM users WHERE user_id = ?", (user_id,))
+    cur.execute("SELECT user_id, username, first_name, avatar_url, prefix, prefix_color, aliases, is_banned, bg_color, bg_emoji, avatar_frame, nickname_color, status_badge FROM users WHERE user_id = ?", (user_id,))
     u = cur.fetchone()
     conn.close()
-    if u and not u[7]: # Если не забанен
-        return jsonify({"user": {"user_id": u[0], "username": u[1], "first_name": u[2], "avatar_url": u[3], "prefix": u[4], "prefix_color": u[5], "aliases": u[6]}})
+    if u and not u[7]:
+        return jsonify({"user": {
+            "user_id": u[0], "username": u[1], "first_name": u[2], "avatar_url": u[3],
+            "prefix": u[4], "prefix_color": u[5], "aliases": u[6], "bg_color": u[8],
+            "bg_emoji": u[9], "avatar_frame": u[10], "nickname_color": u[11], "status_badge": u[12]
+        }})
     return jsonify({"error": "Not found"}), 404
 
 @app.route('/api/invite/use', methods=['POST'])
 def use_invite():
     data = request.json
+    code = data.get('code', '').strip()
+    user_id = data.get('user_id')
+    
     conn = sqlite3.connect(DB_PATH)
     cur = conn.cursor()
-    cur.execute("SELECT is_used FROM invites WHERE code = ?", (data['code'],))
+    cur.execute("SELECT is_used FROM invites WHERE code = ?", (code,))
     invite = cur.fetchone()
+    
     if invite and invite[0] == 0:
-        cur.execute("UPDATE invites SET is_used = 1 WHERE code = ?", (data['code'],))
-        cur.execute("UPDATE users SET is_invited = 1, used_code = ? WHERE user_id = ?", (data['code'], data['user_id']))
+        cur.execute("UPDATE invites SET is_used = 1 WHERE code = ?", (code,))
+        cur.execute("UPDATE users SET is_invited = 1, used_code = ? WHERE user_id = ?", (code, user_id))
         conn.commit()
         conn.close()
         return jsonify({"success": True})
+    
     conn.close()
     return jsonify({"success": False})
 
@@ -707,7 +855,8 @@ def get_posts():
     
     query = """
         SELECT p.id, p.author_id, p.title, p.content, p.image_url, p.allow_comments, p.is_pinned,
-               u.first_name, u.avatar_url, u.prefix, u.prefix_color, u.is_banned
+               u.first_name, u.avatar_url, u.prefix, u.prefix_color, u.is_banned,
+               u.avatar_frame, u.nickname_color, u.status_badge
         FROM posts p LEFT JOIN users u ON p.author_id = u.user_id
     """
     
@@ -724,24 +873,26 @@ def get_posts():
     return jsonify([{
         "id": r[0], "author_id": r[1], "title": r[2], "content": r[3], "image_url": r[4], 
         "allow_comments": r[5], "is_pinned": r[6], "author_name": r[7], "avatar_url": r[8],
-        "prefix": r[9], "prefix_color": r[10], "is_banned": r[11]
+        "prefix": r[9], "prefix_color": r[10], "is_banned": r[11], "avatar_frame": r[12],
+        "nickname_color": r[13], "status_badge": r[14]
     } for r in rows])
 
 @app.route('/api/posts/<int:post_id>')
 def get_post_detail(post_id):
     conn = sqlite3.connect(DB_PATH)
     cur = conn.cursor()
-    # Пост
+    
     cur.execute("""
         SELECT p.id, p.author_id, p.title, p.content, p.image_url, p.allow_comments,
-               u.first_name, u.avatar_url, u.prefix, u.prefix_color, u.is_banned
+               u.first_name, u.avatar_url, u.prefix, u.prefix_color, u.is_banned,
+               u.avatar_frame, u.nickname_color, u.status_badge
         FROM posts p LEFT JOIN users u ON p.author_id = u.user_id WHERE p.id = ?
     """, (post_id,))
     p = cur.fetchone()
     
-    # Комменты
     cur.execute("""
-        SELECT c.id, c.author_id, c.content, u.first_name, u.avatar_url, u.prefix, u.prefix_color, u.is_banned
+        SELECT c.id, c.author_id, c.content, u.first_name, u.avatar_url, u.prefix, u.prefix_color, u.is_banned,
+               u.avatar_frame, u.nickname_color, u.status_badge
         FROM comments c LEFT JOIN users u ON c.author_id = u.user_id WHERE c.post_id = ? ORDER BY c.id ASC
     """, (post_id,))
     comments = cur.fetchall()
@@ -751,11 +902,13 @@ def get_post_detail(post_id):
     
     post_dict = {
         "id": p[0], "author_id": p[1], "title": p[2], "content": p[3], "image_url": p[4], "allow_comments": p[5],
-        "author_name": p[6], "avatar_url": p[7], "prefix": p[8], "prefix_color": p[9], "is_banned": p[10]
+        "author_name": p[6], "avatar_url": p[7], "prefix": p[8], "prefix_color": p[9], "is_banned": p[10],
+        "avatar_frame": p[11], "nickname_color": p[12], "status_badge": p[13]
     }
     comments_list = [{
         "id": c[0], "author_id": c[1], "content": c[2], "author_name": c[3], 
-        "avatar_url": c[4], "prefix": c[5], "prefix_color": c[6], "is_banned": c[7]
+        "avatar_url": c[4], "prefix": c[5], "prefix_color": c[6], "is_banned": c[7],
+        "avatar_frame": c[8], "nickname_color": c[9], "status_badge": c[10]
     } for c in comments]
     
     return jsonify({"post": post_dict, "comments": comments_list})
@@ -781,51 +934,6 @@ def add_comment(post_id):
     conn.commit()
     conn.close()
     return jsonify({"status": "ok"})
-
-# --- ADMIN ROUTES (/inv) ---
-@app.route('/inv')
-def admin_panel():
-    conn = sqlite3.connect(DB_PATH)
-    cur = conn.cursor()
-    cur.execute("SELECT * FROM users")
-    users = cur.fetchall()
-    conn.close()
-    return render_template_string(ADMIN_TEMPLATE, users=users)
-
-@app.route('/inv/generate', methods=['POST'])
-def admin_gen_invite():
-    code = generate_code()
-    conn = sqlite3.connect(DB_PATH)
-    cur = conn.cursor()
-    cur.execute("INSERT INTO invites (code) VALUES (?)", (code,))
-    conn.commit()
-    conn.close()
-    return redirect('/inv')
-
-@app.route('/inv/edit_user', methods=['POST'])
-def admin_edit_user():
-    user_id = request.form.get('user_id')
-    prefix = request.form.get('prefix', '').upper()
-    prefix_color = request.form.get('prefix_color', '#ffffff')
-    aliases = request.form.get('aliases', '')
-    
-    conn = sqlite3.connect(DB_PATH)
-    cur = conn.cursor()
-    cur.execute("UPDATE users SET prefix = ?, prefix_color = ?, aliases = ? WHERE user_id = ?", 
-                (prefix, prefix_color, aliases, user_id))
-    conn.commit()
-    conn.close()
-    return redirect('/inv')
-
-@app.route('/inv/ban', methods=['POST'])
-def admin_ban_user():
-    user_id = request.form.get('user_id')
-    conn = sqlite3.connect(DB_PATH)
-    cur = conn.cursor()
-    cur.execute("UPDATE users SET is_banned = CASE WHEN is_banned=1 THEN 0 ELSE 1 END WHERE user_id = ?", (user_id,))
-    conn.commit()
-    conn.close()
-    return redirect('/inv')
 
 if __name__ == '__main__':
     app.run(host='0.0.0.0', port=5000, debug=True)
